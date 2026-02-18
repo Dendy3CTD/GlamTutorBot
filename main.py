@@ -1,7 +1,18 @@
+import os
+import logging
 import telebot
 from telebot import types
 
-bot = telebot.TeleBot('8397040934:AAHA_1loP9-XQnyfobIfy7VW_TX1dRD1myM')
+# Включить логирование для отладки
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Токен из переменной окружения или из кода (для разработки)
+BOT_TOKEN = os.environ.get('GLAMTUTOR_BOT_TOKEN') or '8397040934:AAHA_1loP9-XQnyfobIfy7VW_TX1dRD1myM'
+bot = telebot.TeleBot(BOT_TOKEN)
 
 # База данных товаров
 products = {
@@ -30,13 +41,42 @@ back_button = types.KeyboardButton('Назад')
 back.add(back_button)
 
 
+def check_bot_token():
+    """Проверка токена при запуске."""
+    try:
+        me = bot.get_me()
+        logger.info(f"Бот запущен: @{me.username} (id={me.id})")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка подключения к Telegram: {e}")
+        logger.error("Проверьте токен бота в @BotFather и что бот не заблокирован.")
+        return False
+
+
 @bot.message_handler(commands=['start'])
 def start_message(message):
-    bot.send_message(message.chat.id, "Добро пожаловать в GlamTutorBot! 🎨\n\nВыберите интересующий вас раздел:", reply_markup=menu)
+    try:
+        bot.send_message(message.chat.id, "Добро пожаловать в GlamTutorBot! 🎨\n\nВыберите интересующий вас раздел:", reply_markup=menu)
+    except Exception as e:
+        logger.exception("Ошибка в start_message: %s", e)
+
+
+@bot.message_handler(commands=['help'])
+def help_message(message):
+    try:
+        bot.send_message(
+            message.chat.id,
+            "Используйте кнопки меню или команду /start. Каталог товаров — для выбора товара и заказа.",
+            reply_markup=menu
+        )
+    except Exception as e:
+        logger.exception("Ошибка в help_message: %s", e)
 
 
 @bot.message_handler(content_types=['text'])
 def text_message(message):
+    if not message.text:
+        return
     if message.text == "Назад":
         bot.send_message(message.chat.id, 'Что вас интересует?', reply_markup=menu)
     elif message.text == 'Цена':
@@ -52,6 +92,16 @@ def text_message(message):
         show_catalog(message)
     elif message.text == 'Каталог товаров':
         show_catalog(message)
+    else:
+        # Ответ на любое другое сообщение — подсказка вернуться в меню
+        try:
+            bot.send_message(
+                message.chat.id,
+                "Используйте кнопки меню ниже или нажмите /start для главного меню.",
+                reply_markup=menu
+            )
+        except Exception as e:
+            logger.exception("Ошибка отправки сообщения: %s", e)
 
 
 def show_catalog(message):
@@ -81,8 +131,11 @@ def show_catalog(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('product_'))
 def product_callback(call):
     """Обработка выбора товара"""
-    sku = call.data.split('_')[1]
-    
+    try:
+        sku = call.data.split('_')[1]
+    except IndexError:
+        bot.answer_callback_query(call.id, "Ошибка данных")
+        return
     if sku in products:
         product = products[sku]
         
@@ -112,12 +165,17 @@ def product_callback(call):
             f"Вы можете написать продавцу или оформить заказ прямо здесь!"
         )
         
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=product_info,
-            reply_markup=keyboard
-        )
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=product_info,
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.warning("edit_message_text (product): %s", e)
+            bot.send_message(call.message.chat.id, product_info, reply_markup=keyboard)
+        bot.answer_callback_query(call.id)
     else:
         bot.answer_callback_query(call.id, "Товар не найден")
 
@@ -146,13 +204,16 @@ def order_callback(call):
             f"Нажмите кнопку ниже, чтобы написать продавцу и подтвердить заказ:"
         )
         
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=order_message,
-            reply_markup=keyboard
-        )
-        
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=order_message,
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.warning("edit_message_text (order): %s", e)
+            bot.send_message(call.message.chat.id, order_message, reply_markup=keyboard)
         bot.answer_callback_query(call.id, "Заказ оформлен! Напишите продавцу для подтверждения.")
     else:
         bot.answer_callback_query(call.id, "Ошибка при оформлении заказа")
@@ -174,12 +235,20 @@ def back_to_catalog_callback(call):
         else:
             keyboard.add(buttons[i])
     
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text="🛍️ Каталог товаров:\n\nВыберите товар для просмотра деталей и заказа:",
-        reply_markup=keyboard
-    )
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="🛍️ Каталог товаров:\n\nВыберите товар для просмотра деталей и заказа:",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.warning("edit_message_text (back): %s", e)
+        bot.send_message(
+            call.message.chat.id,
+            "🛍️ Каталог товаров:\n\nВыберите товар для просмотра деталей и заказа:",
+            reply_markup=keyboard
+        )
 
 
 def forward(message):
@@ -189,4 +258,13 @@ def forward(message):
     bot.register_next_step_handler(message, forward)
 
 
-bot.infinity_polling()
+if __name__ == '__main__':
+    if not check_bot_token():
+        print("Не удалось подключиться к Telegram. Проверьте токен и интернет.")
+        exit(1)
+    try:
+        # skip_pending=True — не обрабатывать старые сообщения после перезапуска
+        bot.infinity_polling(skip_pending=True)
+    except Exception as e:
+        logger.exception("Бот остановился с ошибкой: %s", e)
+        exit(1)
