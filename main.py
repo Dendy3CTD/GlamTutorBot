@@ -75,6 +75,19 @@ user_settings_state = {}  # chat_id -> 'city' | 'nickname' | 'comment' | 'feedba
 # Прошлые заказы (chat_id -> список заказов)
 completed_orders = {}
 
+# Обратная связь: список сообщений для админки (chat_id, text, date, username)
+feedback_list = []
+
+# Админ-панель: ID пользователей Telegram. Узнать свой ID: напишите боту @userinfobot в Telegram
+_admin_ids = os.environ.get('ADMIN_IDS', '').strip()
+ADMIN_IDS = [int(x.strip()) for x in _admin_ids.split(',') if x.strip()]
+# Если переменная ADMIN_IDS не задана — укажите ID здесь:
+if not ADMIN_IDS:
+    ADMIN_IDS = [1290112937]  # @So_it_will_go
+
+# Состояние админа при добавлении товара / ответе на обратную связь
+admin_state = {}
+
 # Список городов для выбора
 CITIES = ['Москва', 'Санкт-Петербург', 'Новосибирск', 'Екатеринбург', 'Казань', 'Другой']
 
@@ -195,11 +208,227 @@ def help_message(message):
         logger.exception("Ошибка в help_message: %s", e)
 
 
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    """Админ-панель: только для пользователей из ADMIN_IDS."""
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "Доступ запрещён.")
+        return
+    text = "🔐 <b>Админ-панель</b>\n\nВыберите действие:"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("➕ Добавить товар", callback_data="admin_add_product"))
+    keyboard.add(types.InlineKeyboardButton("💬 Обратная связь (ответы)", callback_data="admin_feedback_list"))
+    keyboard.add(types.InlineKeyboardButton("❌ Выход из админки", callback_data="admin_exit"))
+    bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_exit")
+def admin_exit_callback(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id)
+        return
+    if call.message.chat.id in admin_state:
+        del admin_state[call.message.chat.id]
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="Выход из админ-панели.")
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_add_product")
+def admin_add_product_start(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id)
+        return
+    admin_state[call.message.chat.id] = {'step': 'add_name', 'data': {}}
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="➕ <b>Добавление товара</b>\n\nШаг 1/4. Введите <b>название</b> товара:",
+            parse_mode='HTML'
+        )
+    except Exception:
+        bot.send_message(call.message.chat.id, "➕ Добавление товара\n\nШаг 1/4. Введите название товара:")
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_feedback_list")
+def admin_feedback_list_callback(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id)
+        return
+    if not feedback_list:
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="💬 Обратная связь пуста."
+            )
+        except Exception:
+            bot.send_message(call.message.chat.id, "💬 Обратная связь пуста.")
+        bot.answer_callback_query(call.id)
+        return
+    text = "💬 <b>Обратная связь</b>\n\nВыберите, кому ответить:"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for i, fb in enumerate(feedback_list[-20:]):  # последние 20
+        short = (fb['text'][:40] + '…') if len(fb['text']) > 40 else fb['text']
+        keyboard.add(types.InlineKeyboardButton(
+            f"#{i+1} {fb['date']} | @{fb['username']}: {short}",
+            callback_data=f"admin_reply_{i}"
+        ))
+    keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_back"))
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+    except Exception:
+        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=keyboard)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("admin_reply_"))
+def admin_reply_callback(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id)
+        return
+    try:
+        idx = int(call.data.replace("admin_reply_", ""))
+    except ValueError:
+        bot.answer_callback_query(call.id)
+        return
+    recent = feedback_list[-20:]
+    if idx < 0 or idx >= len(recent):
+        bot.answer_callback_query(call.id, "Не найден")
+        return
+    fb = recent[idx]
+    admin_state[call.message.chat.id] = {'step': 'reply_feedback', 'target_chat_id': fb['chat_id'], 'username': fb['username']}
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=f"✏️ Ответ пользователю (@{fb['username']}). Напишите текст ответа в чат:"
+        )
+    except Exception:
+        bot.send_message(call.message.chat.id, f"✏️ Ответ пользователю (@{fb['username']}). Напишите текст ответа в чат:")
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_back")
+def admin_back_callback(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id)
+        return
+    text = "🔐 <b>Админ-панель</b>\n\nВыберите действие:"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("➕ Добавить товар", callback_data="admin_add_product"))
+    keyboard.add(types.InlineKeyboardButton("💬 Обратная связь (ответы)", callback_data="admin_feedback_list"))
+    keyboard.add(types.InlineKeyboardButton("❌ Выход из админки", callback_data="admin_exit"))
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+    except Exception:
+        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=keyboard)
+    bot.answer_callback_query(call.id)
+
+
+def process_admin_input(message):
+    """Обработка ввода админа: добавление товара или ответ на обратную связь."""
+    cid = message.chat.id
+    if cid not in admin_state:
+        return False
+    state = admin_state[cid]
+    step = state.get('step')
+    data = state.get('data', {})
+    text = (message.text or '').strip()
+
+    if step == 'reply_feedback':
+        target = state.get('target_chat_id')
+        try:
+            bot.send_message(target, f"📩 <b>Ответ от поддержки:</b>\n\n{text}", parse_mode='HTML')
+            bot.send_message(cid, "✅ Ответ отправлен.")
+        except Exception as e:
+            bot.send_message(cid, f"Ошибка отправки: {e}")
+        del admin_state[cid]
+        return True
+
+    if step == 'add_name':
+        state['data']['name'] = text or 'Товар'
+        state['step'] = 'add_price'
+        bot.send_message(cid, "Шаг 2/4. Введите <b>цену</b> (число):", parse_mode='HTML')
+        return True
+    if step == 'add_price':
+        try:
+            price = int(text.replace(' ', ''))
+        except ValueError:
+            bot.send_message(cid, "Введите число для цены.")
+            return True
+        state['data']['price'] = price
+        state['step'] = 'add_description'
+        bot.send_message(cid, "Шаг 3/4. Введите <b>описание</b> товара:", parse_mode='HTML')
+        return True
+    if step == 'add_description':
+        state['data']['description'] = text or 'Без описания'
+        state['step'] = 'add_photo'
+        bot.send_message(cid, "Шаг 4/4. Отправьте <b>URL фото</b> или напишите <code>пропустить</code> для заглушки.", parse_mode='HTML')
+        return True
+    if step == 'add_photo':
+        photo = text if text and text.lower() != 'пропустить' else f"https://via.placeholder.com/400x400/FFB6C1/000000?text=Товар"
+        state['data']['photo'] = photo
+        # Сохраняем товар
+        new_sku = f"{len(products) + 1:03d}"
+        while new_sku in products:
+            new_sku = f"{int(new_sku) + 1:03d}"
+        products[new_sku] = {
+            'name': state['data']['name'],
+            'price': state['data']['price'],
+            'description': state['data']['description'],
+            'photo': state['data']['photo']
+        }
+        product_skus.append(new_sku)
+        del admin_state[cid]
+        bot.send_message(cid, f"✅ Товар добавлен! Артикул: <code>{new_sku}</code>", parse_mode='HTML')
+        return True
+    return False
+
+
+@bot.message_handler(content_types=['photo'])
+def admin_photo_handler(message):
+    """При добавлении товара админ может отправить фото — используем file_id."""
+    if not is_admin(message.from_user.id) or message.chat.id not in admin_state:
+        return
+    state = admin_state[message.chat.id]
+    if state.get('step') != 'add_photo':
+        return
+    # Берём самое большое фото (последнее в списке)
+    photo = message.photo[-1]
+    state['data']['photo'] = photo.file_id
+    data = state['data']
+    new_sku = f"{len(products) + 1:03d}"
+    while new_sku in products:
+        new_sku = f"{int(new_sku) + 1:03d}"
+    products[new_sku] = {
+        'name': data['name'],
+        'price': data['price'],
+        'description': data['description'],
+        'photo': data['photo']
+    }
+    product_skus.append(new_sku)
+    del admin_state[message.chat.id]
+    bot.send_message(message.chat.id, f"✅ Товар добавлен с фото! Артикул: <code>{new_sku}</code>", parse_mode='HTML')
+
+
 @bot.message_handler(content_types=['text'])
 def text_message(message):
     if not message.text:
         return
-    
+    # Ввод админа (добавление товара, ответ на обратную связь)
+    if is_admin(message.from_user.id) and message.chat.id in admin_state:
+        if process_admin_input(message):
+            return
+
     if message.text == "⬅️ Назад" or message.text == "Назад":
         bot.send_message(message.chat.id, 'Главное меню:', reply_markup=menu)
     
@@ -347,10 +576,17 @@ def process_settings_input(message):
         user_settings[cid]['comment'] = text or '—'
         bot.send_message(cid, "✅ Комментарий сохранён. Спасибо за отзыв!", reply_markup=menu)
     elif state == 'feedback':
-        # Сохраняем обратную связь (можно отправить продавцу)
         if cid not in user_settings:
             user_settings[cid] = {}
         user_settings[cid]['last_feedback'] = text or '—'
+        # Сохраняем в список для админки (чтобы можно было ответить)
+        username = message.from_user.username or message.from_user.first_name or '—'
+        feedback_list.append({
+            'chat_id': cid,
+            'text': text or '—',
+            'date': datetime.now().strftime('%d.%m.%Y %H:%M'),
+            'username': username
+        })
         bot.send_message(cid, "✅ Спасибо за обратную связь! Мы обязательно учтём ваше сообщение.", reply_markup=menu)
     elif state == 'city_input':
         user_settings[cid]['city'] = text or '—'
