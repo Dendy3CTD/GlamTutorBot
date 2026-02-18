@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import datetime
 import telebot
 from telebot import types
 
@@ -67,13 +68,26 @@ seller_map_link = 'https://yandex.ru/maps/?text=пр. Мира 8'
 
 # Хранение данных заказа (в реальном проекте лучше использовать БД)
 user_orders = {}
+# Настройки пользователя: город, пол, псевдоним, комментарии
+user_settings = {}
+user_settings_state = {}  # chat_id -> 'city' | 'nickname' | 'comment' | 'feedback'
 
-# Меню: только Каталог, Заказать, Настройки
+# Прошлые заказы (chat_id -> список заказов)
+completed_orders = {}
+
+# Список городов для выбора
+CITIES = ['Москва', 'Санкт-Петербург', 'Новосибирск', 'Екатеринбург', 'Казань', 'Другой']
+
+# Главное меню: Начать, Настройки аккаунта, Прошлые заказы, Обратная связь
 menu = types.ReplyKeyboardMarkup(resize_keyboard=True)
-catalog_btn = types.KeyboardButton('🛍️ Каталог товаров')
-order_btn = types.KeyboardButton('📦 Заказать')
-settings_btn = types.KeyboardButton('⚙️ Настройки')
-menu.add(catalog_btn, order_btn, settings_btn)
+menu.add(
+    types.KeyboardButton('🟢 Начать'),
+    types.KeyboardButton('⚙️ Настройки аккаунта')
+)
+menu.add(
+    types.KeyboardButton('📦 Прошлые заказы'),
+    types.KeyboardButton('💬 Обратная связь')
+)
 
 back = types.ReplyKeyboardMarkup(resize_keyboard=True)
 back_button = types.KeyboardButton('⬅️ Назад')
@@ -94,18 +108,75 @@ def check_bot_token():
 
 @bot.message_handler(commands=['start'])
 def start_message(message):
+    """Приветствие с inline-кнопками (как в примере) и основное меню."""
     try:
         welcome_text = (
-            "Добро пожаловать в GlamTutorBot! 🎨\n\n"
-            "Здесь вы можете:\n"
-            "• Просмотреть каталог товаров\n"
-            "• Оформить заказ\n"
-            "• Настроить параметры\n\n"
-            "Выберите интересующий раздел:"
+            "👋 Добро пожаловать в <b>GlamTutorBot</b>!\n\n"
+            "Здесь вы можете просмотреть каталог, оформить заказ или связаться с нами.\n\n"
+            "Выберите действие:"
         )
-        bot.send_message(message.chat.id, welcome_text, reply_markup=menu)
+        start_keyboard = types.InlineKeyboardMarkup(row_width=2)
+        start_keyboard.add(
+            types.InlineKeyboardButton("🛍️ Каталог", callback_data="start_catalog"),
+            types.InlineKeyboardButton("📞 Контакты", callback_data="start_contacts"),
+            types.InlineKeyboardButton("⚙️ Настройки", callback_data="start_settings")
+        )
+        bot.send_message(
+            message.chat.id,
+            welcome_text,
+            parse_mode='HTML',
+            reply_markup=start_keyboard
+        )
+        bot.send_message(message.chat.id, "Или выберите пункт меню ниже:", reply_markup=menu)
     except Exception as e:
         logger.exception("Ошибка в start_message: %s", e)
+
+
+def _fake_message(chat_id):
+    """Вспомогательный объект с полем chat.id для вызова функций, ожидающих message."""
+    m = lambda: None
+    m.chat = lambda: None
+    m.chat.id = chat_id
+    m.text = ''
+    return m
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "start_catalog")
+def start_catalog_callback(call):
+    """Старт: переход в каталог."""
+    bot.answer_callback_query(call.id)
+    show_catalog_feed(_fake_message(call.message.chat.id))
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "start_contacts")
+def start_contacts_callback(call):
+    """Старт: показать контакты сразу."""
+    bot.answer_callback_query(call.id)
+    text = (
+        "📞 <b>Контакты</b>\n\n"
+        f"Телефон: <code>{seller_phone}</code>\n"
+        f"Telegram: {seller_contact}"
+    )
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(
+        "💬 Написать продавцу",
+        url=f"https://t.me/{seller_contact.replace('@', '')}"
+    ))
+    keyboard.add(types.InlineKeyboardButton(
+        "📞 Позвонить",
+        url=f"tel:{seller_phone.replace(' ', '').replace('-', '')}"
+    ))
+    try:
+        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=keyboard)
+    except Exception as e:
+        logger.warning("start_contacts: %s", e)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "start_settings")
+def start_settings_callback(call):
+    """Старт: переход в настройки."""
+    bot.answer_callback_query(call.id)
+    show_settings(_fake_message(call.message.chat.id))
 
 
 @bot.message_handler(commands=['help'])
@@ -113,10 +184,11 @@ def help_message(message):
     try:
         bot.send_message(
             message.chat.id,
-            "Используйте кнопки меню:\n"
-            "🛍️ Каталог товаров - просмотр товаров с фото\n"
-            "📦 Заказать - оформление заказа\n"
-            "⚙️ Настройки - контакты и адрес",
+            "Меню:\n"
+            "🟢 Начать — каталог и приветствие\n"
+            "⚙️ Настройки аккаунта — контакты, город, карты и др.\n"
+            "📦 Прошлые заказы — история заказов\n"
+            "💬 Обратная связь — написать или оставить отзыв",
             reply_markup=menu
         )
     except Exception as e:
@@ -131,16 +203,23 @@ def text_message(message):
     if message.text == "⬅️ Назад" or message.text == "Назад":
         bot.send_message(message.chat.id, 'Главное меню:', reply_markup=menu)
     
-    elif message.text == '🛍️ Каталог товаров' or message.text == 'Каталог товаров':
-        show_catalog_feed(message)
+    elif message.text == '🟢 Начать' or message.text == 'Начать':
+        start_message(message)
     
-    elif message.text == '📦 Заказать' or message.text == 'Заказать':
-        start_order_process(message)
-    
-    elif message.text == '⚙️ Настройки' or message.text == 'Настройки':
+    elif message.text == '⚙️ Настройки аккаунта' or message.text == 'Настройки аккаунта':
         show_settings(message)
     
+    elif message.text == '📦 Прошлые заказы' or message.text == 'Прошлые заказы':
+        show_past_orders(message)
+    
+    elif message.text == '💬 Обратная связь' or message.text == 'Обратная связь':
+        show_feedback(message)
+    
     else:
+        # Режим ввода настроек (город, псевдоним, комментарий)
+        if message.chat.id in user_settings_state:
+            process_settings_input(message)
+            return
         # Если пользователь в процессе заказа, обрабатываем как данные
         if message.chat.id in user_orders:
             process_order_data(message)
@@ -247,17 +326,102 @@ def catalog_nav_callback(call):
     bot.answer_callback_query(call.id)
 
 
+def _ensure_user_settings(chat_id):
+    if chat_id not in user_settings:
+        user_settings[chat_id] = {'city': '', 'gender': '', 'nickname': '', 'comment': ''}
+    return user_settings[chat_id]
+
+
+def process_settings_input(message):
+    """Обработка ввода города, псевдонима, комментария."""
+    cid = message.chat.id
+    if cid not in user_settings_state:
+        return
+    state = user_settings_state.pop(cid)
+    _ensure_user_settings(cid)
+    text = message.text.strip() if message.text else ''
+    if state == 'nickname':
+        user_settings[cid]['nickname'] = text or '—'
+        bot.send_message(cid, f"✅ Псевдоним сохранён: <b>{user_settings[cid]['nickname']}</b>", parse_mode='HTML', reply_markup=menu)
+    elif state == 'comment':
+        user_settings[cid]['comment'] = text or '—'
+        bot.send_message(cid, "✅ Комментарий сохранён. Спасибо за отзыв!", reply_markup=menu)
+    elif state == 'feedback':
+        # Сохраняем обратную связь (можно отправить продавцу)
+        if cid not in user_settings:
+            user_settings[cid] = {}
+        user_settings[cid]['last_feedback'] = text or '—'
+        bot.send_message(cid, "✅ Спасибо за обратную связь! Мы обязательно учтём ваше сообщение.", reply_markup=menu)
+    elif state == 'city_input':
+        user_settings[cid]['city'] = text or '—'
+        bot.send_message(cid, f"✅ Город сохранён: <b>{user_settings[cid]['city']}</b>", parse_mode='HTML', reply_markup=menu)
+
+
+def show_past_orders(message):
+    """Показать прошлые заказы пользователя."""
+    cid = message.chat.id
+    orders = completed_orders.get(cid, [])
+    if not orders:
+        bot.send_message(
+            cid,
+            "📦 <b>Прошлые заказы</b>\n\nУ вас пока нет завершённых заказов.\n\nОформить заказ можно из каталога — нажмите «Начать» и выберите «Каталог».",
+            parse_mode='HTML',
+            reply_markup=menu
+        )
+        return
+    lines = ["📦 <b>Прошлые заказы</b>\n"]
+    for i, o in enumerate(orders[-10:], 1):  # последние 10
+        lines.append(f"{i}. {o.get('product_name', '—')} | {o.get('price', '')}$ | {o.get('date', '')}")
+    bot.send_message(cid, "\n".join(lines), parse_mode='HTML', reply_markup=menu)
+
+
+def show_feedback(message):
+    """Обратная связь: написать в поддержку или оставить сообщение."""
+    text = (
+        "💬 <b>Обратная связь</b>\n\n"
+        "Напишите нам, задайте вопрос или оставьте отзыв. Вы можете написать напрямую продавцу или отправить сообщение через бота."
+    )
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("💬 Написать продавцу", url=f"https://t.me/{seller_contact.replace('@', '')}"))
+    keyboard.add(types.InlineKeyboardButton("✏️ Оставить сообщение в боте", callback_data="feedback_write"))
+    keyboard.add(types.InlineKeyboardButton("⬅️ В меню", callback_data="settings_back"))
+    bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "feedback_write")
+def feedback_write_callback(call):
+    """Запросить текст обратной связи."""
+    user_settings_state[call.message.chat.id] = 'feedback'
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="✏️ Напишите ваше сообщение, вопрос или отзыв в чат:"
+        )
+    except Exception:
+        bot.send_message(call.message.chat.id, "✏️ Напишите ваше сообщение, вопрос или отзыв в чат:")
+    bot.answer_callback_query(call.id)
+
+
 def show_settings(message):
-    """Главный экран настроек с выбором раздела."""
+    """Главный экран настроек с выбором раздела и контактами в тексте."""
     try:
         text = (
             "⚙️ <b>Настройки</b>\n\n"
+            f"📞 <b>Контакты:</b> {seller_phone}, {seller_contact}\n\n"
             "Выберите раздел:"
         )
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         keyboard.add(types.InlineKeyboardButton("📞 Контакты", callback_data="settings_contacts"))
         keyboard.add(types.InlineKeyboardButton("📍 Адрес", callback_data="settings_address"))
         keyboard.add(types.InlineKeyboardButton("🕐 Режим работы", callback_data="settings_hours"))
+        keyboard.add(types.InlineKeyboardButton("🏙 Выбор города", callback_data="settings_city"))
+        keyboard.add(types.InlineKeyboardButton("🗺 Карты", callback_data="settings_maps"))
+        keyboard.add(types.InlineKeyboardButton("🧾 Онлайн чеки", callback_data="settings_receipts"))
+        keyboard.add(types.InlineKeyboardButton("📊 Статистика", callback_data="settings_stats"))
+        keyboard.add(types.InlineKeyboardButton("👤 Пол", callback_data="settings_gender"))
+        keyboard.add(types.InlineKeyboardButton("✏️ Псевдоним", callback_data="settings_nickname"))
+        keyboard.add(types.InlineKeyboardButton("💬 Комментарии", callback_data="settings_comments"))
         keyboard.add(types.InlineKeyboardButton("⬅️ В главное меню", callback_data="settings_back"))
         bot.send_message(
             message.chat.id,
@@ -349,15 +513,184 @@ def settings_hours_callback(call):
     bot.answer_callback_query(call.id)
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "settings_city")
+def settings_city_callback(call):
+    cid = call.message.chat.id
+    _ensure_user_settings(cid)
+    current = user_settings[cid].get('city') or 'не указан'
+    text = f"🏙 <b>Выбор города</b>\n\nТекущий город: <b>{current}</b>\n\nВыберите или введите свой:"
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    for city in CITIES:
+        keyboard.add(types.InlineKeyboardButton(city, callback_data=f"set_city_{city}"))
+    keyboard.add(types.InlineKeyboardButton("✏️ Ввести свой город", callback_data="set_city_input"))
+    keyboard.add(types.InlineKeyboardButton("⬅️ В настройки", callback_data="settings_menu"))
+    try:
+        bot.edit_message_text(chat_id=cid, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+    except Exception:
+        bot.send_message(cid, text, parse_mode='HTML', reply_markup=keyboard)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("set_city_"))
+def set_city_callback(call):
+    if call.data == "set_city_input":
+        user_settings_state[call.message.chat.id] = 'city_input'
+        try:
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="✏️ Введите название города:")
+        except Exception:
+            bot.send_message(call.message.chat.id, "✏️ Введите название города:")
+        bot.answer_callback_query(call.id)
+        return
+    city = call.data.replace("set_city_", "", 1)
+    user_settings[call.message.chat.id]['city'] = city
+    text = f"✅ Город сохранён: <b>{city}</b>"
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=_settings_back_keyboard())
+    except Exception:
+        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=_settings_back_keyboard())
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "settings_maps")
+def settings_maps_callback(call):
+    text = f"🗺 <b>Карты</b>\n\nАдрес: {seller_address}\n\nОткройте в картах:"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if seller_map_link:
+        keyboard.add(types.InlineKeyboardButton("🗺 Открыть в картах", url=seller_map_link))
+    keyboard.add(types.InlineKeyboardButton("⬅️ В настройки", callback_data="settings_menu"))
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+    except Exception:
+        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=keyboard)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "settings_receipts")
+def settings_receipts_callback(call):
+    text = "🧾 <b>Онлайн чеки</b>\n\nЧек можно получить в электронном виде после оплаты. Укажите при заказе или напишите продавцу."
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=_settings_back_keyboard())
+    except Exception:
+        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=_settings_back_keyboard())
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "settings_stats")
+def settings_stats_callback(call):
+    text = "📊 <b>Статистика</b>\n\nЗдесь будет отображаться ваша статистика заказов. Раздел в разработке."
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=_settings_back_keyboard())
+    except Exception:
+        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=_settings_back_keyboard())
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "settings_gender")
+def settings_gender_callback(call):
+    cid = call.message.chat.id
+    _ensure_user_settings(cid)
+    current = user_settings[cid].get('gender') or 'не указан'
+    text = f"👤 <b>Пол</b>\n\nТекущее: <b>{current}</b>\n\nВыберите:"
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("Мужской", callback_data="set_gender_Мужской"),
+        types.InlineKeyboardButton("Женский", callback_data="set_gender_Женский")
+    )
+    keyboard.add(types.InlineKeyboardButton("Другое", callback_data="set_gender_Другое"))
+    keyboard.add(types.InlineKeyboardButton("⬅️ В настройки", callback_data="settings_menu"))
+    try:
+        bot.edit_message_text(chat_id=cid, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+    except Exception:
+        bot.send_message(cid, text, parse_mode='HTML', reply_markup=keyboard)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("set_gender_"))
+def set_gender_callback(call):
+    gender = call.data.replace("set_gender_", "", 1)
+    _ensure_user_settings(call.message.chat.id)['gender'] = gender
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=f"✅ Пол сохранён: <b>{gender}</b>", parse_mode='HTML', reply_markup=_settings_back_keyboard())
+    except Exception:
+        bot.send_message(call.message.chat.id, f"✅ Пол сохранён: {gender}", parse_mode='HTML', reply_markup=_settings_back_keyboard())
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "settings_nickname")
+def settings_nickname_callback(call):
+    cid = call.message.chat.id
+    _ensure_user_settings(cid)
+    current = user_settings[cid].get('nickname') or 'не указан'
+    text = f"✏️ <b>Псевдоним</b>\n\nТекущий: <b>{current}</b>\n\nНажмите кнопку и введите псевдоним в чат:"
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("✏️ Ввести псевдоним", callback_data="set_nickname_input"))
+    keyboard.add(types.InlineKeyboardButton("⬅️ В настройки", callback_data="settings_menu"))
+    try:
+        bot.edit_message_text(chat_id=cid, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+    except Exception:
+        bot.send_message(cid, text, parse_mode='HTML', reply_markup=keyboard)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_nickname_input")
+def set_nickname_input_callback(call):
+    user_settings_state[call.message.chat.id] = 'nickname'
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="✏️ Введите псевдоним в чат:")
+    except Exception:
+        bot.send_message(call.message.chat.id, "✏️ Введите псевдоним в чат:")
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "settings_comments")
+def settings_comments_callback(call):
+    text = "💬 <b>Комментарии</b>\n\nОставьте отзыв или комментарий. Нажмите кнопку и напишите в чат."
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("✏️ Оставить комментарий", callback_data="set_comment_input"))
+    keyboard.add(types.InlineKeyboardButton("⬅️ В настройки", callback_data="settings_menu"))
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+    except Exception:
+        bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=keyboard)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_comment_input")
+def set_comment_input_callback(call):
+    user_settings_state[call.message.chat.id] = 'comment'
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="✏️ Напишите комментарий в чат:")
+    except Exception:
+        bot.send_message(call.message.chat.id, "✏️ Напишите комментарий в чат:")
+    bot.answer_callback_query(call.id)
+
+
+def _settings_menu_keyboard():
+    """Клавиатура главного меню настроек."""
+    k = types.InlineKeyboardMarkup(row_width=1)
+    k.add(types.InlineKeyboardButton("📞 Контакты", callback_data="settings_contacts"))
+    k.add(types.InlineKeyboardButton("📍 Адрес", callback_data="settings_address"))
+    k.add(types.InlineKeyboardButton("🕐 Режим работы", callback_data="settings_hours"))
+    k.add(types.InlineKeyboardButton("🏙 Выбор города", callback_data="settings_city"))
+    k.add(types.InlineKeyboardButton("🗺 Карты", callback_data="settings_maps"))
+    k.add(types.InlineKeyboardButton("🧾 Онлайн чеки", callback_data="settings_receipts"))
+    k.add(types.InlineKeyboardButton("📊 Статистика", callback_data="settings_stats"))
+    k.add(types.InlineKeyboardButton("👤 Пол", callback_data="settings_gender"))
+    k.add(types.InlineKeyboardButton("✏️ Псевдоним", callback_data="settings_nickname"))
+    k.add(types.InlineKeyboardButton("💬 Комментарии", callback_data="settings_comments"))
+    k.add(types.InlineKeyboardButton("⬅️ В главное меню", callback_data="settings_back"))
+    return k
+
+
 @bot.callback_query_handler(func=lambda c: c.data == "settings_menu")
 def settings_menu_callback(call):
     """Возврат в меню настроек (из подраздела)."""
-    text = "⚙️ <b>Настройки</b>\n\nВыберите раздел:"
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(types.InlineKeyboardButton("📞 Контакты", callback_data="settings_contacts"))
-    keyboard.add(types.InlineKeyboardButton("📍 Адрес", callback_data="settings_address"))
-    keyboard.add(types.InlineKeyboardButton("🕐 Режим работы", callback_data="settings_hours"))
-    keyboard.add(types.InlineKeyboardButton("⬅️ В главное меню", callback_data="settings_back"))
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"📞 <b>Контакты:</b> {seller_phone}, {seller_contact}\n\n"
+        "Выберите раздел:"
+    )
+    keyboard = _settings_menu_keyboard()
     try:
         bot.edit_message_text(
             chat_id=call.message.chat.id,
@@ -540,6 +873,19 @@ def process_order_data(message):
             except Exception as e:
                 logger.warning(f"Не удалось отправить заказ продавцу: {e}")
             
+            # Сохраняем в прошлые заказы
+            cid = message.chat.id
+            if cid not in completed_orders:
+                completed_orders[cid] = []
+            completed_orders[cid].append({
+                'product_name': product['name'],
+                'sku': order['sku'],
+                'price': product['price'],
+                'date': datetime.now().strftime('%d.%m.%Y'),
+                'name': order['name'],
+                'phone': order['phone'],
+                'address': order['address']
+            })
             # Очищаем данные заказа
             del user_orders[message.chat.id]
             
